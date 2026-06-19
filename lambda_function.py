@@ -11,7 +11,9 @@ import boto3
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_MODEL = "claude-sonnet-4-6"
 S3_BUCKET = "webpage-to-podcast-chadgracia"
-DEFAULT_VOICE = "Joanna"
+FALLBACK_VOICE = "Joanna"
+# Most natural engine first; each voice uses the best one it supports.
+ENGINE_PRIORITY = ["generative", "long-form", "neural", "standard"]
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -26,22 +28,18 @@ def lambda_handler(event, context):
     try:
         params = event.get("queryStringParameters") or {}
         url = params.get("url")
-        voice_id = params.get("voice") or DEFAULT_VOICE
+        voice_id = params.get("voice") or _default_voice_id()
 
         if not url:
             return _html_response(200, _form_page(voice_id))
 
         voice = _lookup_voice(voice_id)
         if voice is None:
-            voice_id = DEFAULT_VOICE
+            voice_id = _default_voice_id()
             voice = _lookup_voice(voice_id)
 
         language = voice["LanguageName"] if voice else "English"
-        engine = (
-            "neural"
-            if voice and "neural" in voice.get("SupportedEngines", [])
-            else "standard"
-        )
+        engine = _best_engine(voice)
 
         page_html = _fetch_page(url)
         text = _html_to_text(page_html)
@@ -75,6 +73,23 @@ def _lookup_voice(voice_id):
     return None
 
 
+def _best_engine(voice):
+    supported = voice.get("SupportedEngines", []) if voice else []
+    for engine in ENGINE_PRIORITY:
+        if engine in supported:
+            return engine
+    return "standard"
+
+
+def _default_voice_id():
+    for voice in _get_voices():
+        if voice.get("LanguageCode") == "en-US" and "generative" in voice.get(
+            "SupportedEngines", []
+        ):
+            return voice["Id"]
+    return FALLBACK_VOICE
+
+
 def _voice_select_html(selected):
     groups = {}
     for voice in _get_voices():
@@ -83,13 +98,26 @@ def _voice_select_html(selected):
     parts = ['<select name="voice" id="voice">']
     for lang in sorted(groups):
         parts.append('<optgroup label="{}">'.format(html.escape(lang, quote=True)))
-        for voice in sorted(groups[lang], key=lambda v: v["Name"]):
+        # Generative-capable voices first, then alphabetical by name.
+        ordered = sorted(
+            groups[lang],
+            key=lambda v: (
+                0 if "generative" in v.get("SupportedEngines", []) else 1,
+                v["Name"],
+            ),
+        )
+        for voice in ordered:
             chosen = " selected" if voice["Id"] == selected else ""
+            label = "{name} ({lang} · {engine})".format(
+                name=voice["Name"],
+                lang=lang,
+                engine=_best_engine(voice),
+            )
             parts.append(
-                '<option value="{vid}"{sel}>{name}</option>'.format(
+                '<option value="{vid}"{sel}>{label}</option>'.format(
                     vid=html.escape(voice["Id"], quote=True),
                     sel=chosen,
-                    name=html.escape(voice["Name"]),
+                    label=html.escape(label),
                 )
             )
         parts.append("</optgroup>")
