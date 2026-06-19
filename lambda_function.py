@@ -176,9 +176,17 @@ def _generate_script(text, language):
     prompt = (
         "Turn the following article into an engaging, conversational spoken "
         "podcast script of about 200 to 250 words. Write the entire script in "
-        "{lang}. Use plain prose only: no markdown, no headings, no stage "
-        "directions, no speaker labels, no sound cues. Write only the words a "
-        "text-to-speech engine should read aloud.\n\nArticle:\n".format(lang=language)
+        "{lang}. The article summary is the core of the episode, so keep it "
+        "mostly about the article. As the host, naturally weave in a few "
+        "genuine, warm affirmations to the listener throughout the flow, such "
+        "as an uplifting line near the opening and a kind, encouraging sign-off "
+        "at the end. Make these compliments feel specific and sincere so the "
+        "listener feels good about their day, but keep them subtle and woven "
+        "into the conversation rather than a separate pep-talk block, and never "
+        "cheesy or over-the-top. Use plain prose only: no markdown, no "
+        "headings, no stage directions, no speaker labels, no sound cues. "
+        "Write only the words a text-to-speech engine should read aloud."
+        "\n\nArticle:\n".format(lang=language)
         + text
     )
     payload = json.dumps(
