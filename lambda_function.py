@@ -11,29 +11,113 @@ import boto3
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_MODEL = "claude-sonnet-4-6"
 S3_BUCKET = "webpage-to-podcast-chadgracia"
+DEFAULT_VOICE = "Joanna"
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+
+# Cache the Polly voice catalog for the life of a warm container so
+# DescribeVoices is only called once.
+_VOICES = None
 
 
 def lambda_handler(event, context):
     try:
         params = event.get("queryStringParameters") or {}
         url = params.get("url")
+        voice_id = params.get("voice") or DEFAULT_VOICE
 
         if not url:
-            return _html_response(200, _form_page())
+            return _html_response(200, _form_page(voice_id))
+
+        voice = _lookup_voice(voice_id)
+        if voice is None:
+            voice_id = DEFAULT_VOICE
+            voice = _lookup_voice(voice_id)
+
+        language = voice["LanguageName"] if voice else "English"
+        engine = (
+            "neural"
+            if voice and "neural" in voice.get("SupportedEngines", [])
+            else "standard"
+        )
 
         page_html = _fetch_page(url)
         text = _html_to_text(page_html)
-        script = _generate_script(text)
-        audio = _synthesize(script)
+        script = _generate_script(text, language)
+        audio = _synthesize(script, voice_id, engine)
         audio_url = _upload_and_sign(audio)
 
-        return _html_response(200, _result_page(url, audio_url, script))
+        return _html_response(200, _result_page(url, audio_url, script, voice_id))
     except Exception as exc:  # noqa: BLE001
         return _html_response(500, _error_page(str(exc)))
+
+
+def _get_voices():
+    global _VOICES
+    if _VOICES is None:
+        polly = boto3.client("polly")
+        voices = []
+        resp = polly.describe_voices()
+        voices.extend(resp.get("Voices", []))
+        while resp.get("NextToken"):
+            resp = polly.describe_voices(NextToken=resp["NextToken"])
+            voices.extend(resp.get("Voices", []))
+        _VOICES = voices
+    return _VOICES
+
+
+def _lookup_voice(voice_id):
+    for voice in _get_voices():
+        if voice["Id"] == voice_id:
+            return voice
+    return None
+
+
+def _voice_select_html(selected):
+    groups = {}
+    for voice in _get_voices():
+        groups.setdefault(voice["LanguageName"], []).append(voice)
+
+    parts = ['<select name="voice" id="voice">']
+    for lang in sorted(groups):
+        parts.append('<optgroup label="{}">'.format(html.escape(lang, quote=True)))
+        for voice in sorted(groups[lang], key=lambda v: v["Name"]):
+            chosen = " selected" if voice["Id"] == selected else ""
+            parts.append(
+                '<option value="{vid}"{sel}>{name}</option>'.format(
+                    vid=html.escape(voice["Id"], quote=True),
+                    sel=chosen,
+                    name=html.escape(voice["Name"]),
+                )
+            )
+        parts.append("</optgroup>")
+    parts.append("</select>")
+    return "".join(parts)
+
+
+def _controls_html(url_value, voice_id):
+    # Input + voice dropdown + button. The button builds the query string in
+    # JS so both url and voice are encodeURIComponent-escaped.
+    return (
+        '<input type="url" id="url" name="url" '
+        'placeholder="https://example.com/article" value="{url}" required>'
+        '<label for="voice">Voice</label>'
+        "{select}"
+        '<button type="button" onclick="go()">Make Podcast</button>'
+        "<script>"
+        "function go(){{"
+        'var u=document.getElementById("url").value;'
+        'var v=document.getElementById("voice").value;'
+        "if(!u){{return;}}"
+        'window.location="?url="+encodeURIComponent(u)+"&voice="+encodeURIComponent(v);'
+        "}}"
+        "</script>"
+    ).format(
+        url=html.escape(url_value, quote=True),
+        select=_voice_select_html(voice_id),
+    )
 
 
 def _fetch_page(url):
@@ -60,13 +144,14 @@ def _html_to_text(page_html):
     return cleaned[:8000]
 
 
-def _generate_script(text):
+def _generate_script(text, language):
     prompt = (
         "Turn the following article into an engaging, conversational spoken "
-        "podcast script of about 200 to 250 words. Use plain prose only: no "
-        "markdown, no headings, no stage directions, no speaker labels, no "
-        "sound cues. Write only the words a text-to-speech engine should read "
-        "aloud.\n\nArticle:\n" + text
+        "podcast script of about 200 to 250 words. Write the entire script in "
+        "{lang}. Use plain prose only: no markdown, no headings, no stage "
+        "directions, no speaker labels, no sound cues. Write only the words a "
+        "text-to-speech engine should read aloud.\n\nArticle:\n".format(lang=language)
+        + text
     )
     payload = json.dumps(
         {
@@ -91,13 +176,13 @@ def _generate_script(text):
     return data["content"][0]["text"].strip()
 
 
-def _synthesize(script):
+def _synthesize(script, voice_id, engine):
     polly = boto3.client("polly")
     result = polly.synthesize_speech(
         Text=script,
         OutputFormat="mp3",
-        VoiceId="Joanna",
-        Engine="neural",
+        VoiceId=voice_id,
+        Engine=engine,
     )
     return result["AudioStream"].read()
 
@@ -126,7 +211,7 @@ def _html_response(status, body):
     }
 
 
-def _form_page():
+def _form_page(voice_id):
     return """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -134,24 +219,22 @@ def _form_page():
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Webpage to Podcast</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 60px auto; padding: 0 20px; }
-  h1 { font-size: 1.6rem; }
-  input { width: 100%; padding: 12px; font-size: 1rem; box-sizing: border-box; }
-  button { margin-top: 12px; padding: 12px 20px; font-size: 1rem; cursor: pointer; }
+  body {{ font-family: system-ui, sans-serif; max-width: 640px; margin: 60px auto; padding: 0 20px; }}
+  h1 {{ font-size: 1.6rem; }}
+  input, select {{ width: 100%; padding: 12px; font-size: 1rem; box-sizing: border-box; margin-top: 8px; }}
+  label {{ display: block; margin-top: 16px; font-weight: 600; }}
+  button {{ margin-top: 16px; padding: 12px 20px; font-size: 1rem; cursor: pointer; }}
 </style>
 </head>
 <body>
   <h1>Webpage to Podcast</h1>
-  <p>Paste a webpage URL and turn it into a short spoken podcast.</p>
-  <form method="get" action="">
-    <input type="url" name="url" placeholder="https://example.com/article" required>
-    <button type="submit">Make Podcast</button>
-  </form>
+  <p>Paste a webpage URL, pick a voice, and turn it into a short spoken podcast.</p>
+  {controls}
 </body>
-</html>"""
+</html>""".format(controls=_controls_html("", voice_id))
 
 
-def _result_page(source_url, audio_url, script):
+def _result_page(source_url, audio_url, script, voice_id):
     return """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -162,8 +245,11 @@ def _result_page(source_url, audio_url, script):
   body {{ font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 20px; line-height: 1.6; }}
   h1 {{ font-size: 1.6rem; }}
   audio {{ width: 100%; margin: 16px 0; }}
+  input, select {{ width: 100%; padding: 12px; font-size: 1rem; box-sizing: border-box; margin-top: 8px; }}
+  label {{ display: block; margin-top: 16px; font-weight: 600; }}
+  button {{ margin-top: 16px; padding: 12px 20px; font-size: 1rem; cursor: pointer; }}
   .script {{ background: #f5f5f5; padding: 16px 20px; border-radius: 8px; white-space: pre-wrap; }}
-  a.back {{ display: inline-block; margin-top: 24px; }}
+  hr {{ margin: 32px 0; border: none; border-top: 1px solid #ddd; }}
 </style>
 </head>
 <body>
@@ -172,12 +258,15 @@ def _result_page(source_url, audio_url, script):
   <p>Source: <a href="{source_url}">{source_url}</a></p>
   <h2>Script</h2>
   <div class="script">{script}</div>
-  <a class="back" href="">Make another</a>
+  <hr>
+  <h2>Make another</h2>
+  {controls}
 </body>
 </html>""".format(
         audio_url=html.escape(audio_url, quote=True),
         source_url=html.escape(source_url, quote=True),
         script=html.escape(script),
+        controls=_controls_html(source_url, voice_id),
     )
 
 
